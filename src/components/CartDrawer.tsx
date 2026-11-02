@@ -1,22 +1,23 @@
 import CartItemsList from './CartItemsList';
-import { useCartStore } from '../store/CartStore';
-import { useShallow } from 'zustand/shallow';
+import CartErrorBanner from './CartErrorBanner';
+import CheckoutButton from './CheckoutButton';
 
 type Props = {
   isOpen: boolean;
   onClose: () => void;
 };
 
+/**
+ * CartDrawer is now a pure layout shell.
+ *
+ * All state subscriptions are pushed to leaf components:
+ *   - CartItemsList   → subscribes to machine context.items
+ *   - CartErrorBanner → subscribes to machine context.error
+ *   - CheckoutButton  → subscribes to machine transition capabilities
+ *
+ * This prevents the container from re-rendering during state transitions.
+ */
 export default function CartDrawer({ isOpen, onClose }: Props) {
-  const { onCheckout, checkoutStatus, cartError, itemCount } = useCartStore(
-    useShallow((state) => ({
-      onCheckout: state.checkout,
-      checkoutStatus: state.checkoutStatus,
-      cartError: state.cartError,
-      itemCount: state.items.length,
-    }))
-  );
-
   return (
     <>
       {isOpen && (
@@ -43,28 +44,10 @@ export default function CartDrawer({ isOpen, onClose }: Props) {
           <CartItemsList />
         </div>
 
-        <div className="cart-checkout-status">
-          {checkoutStatus === 'error' && (
-            <p className="cart-checkout-error">
-              Error occurred: {cartError}
-            </p>
-          )}
-          {checkoutStatus === 'success' && (
-            <p className="cart-checkout-success">Checkout successful!</p>
-          )}
-          {checkoutStatus === 'submitting' && (
-            <p className="cart-checkout-submitting">Checking out...</p>
-          )}
-        </div>
+        <CartErrorBanner />
 
         <div className="cart-drawer-footer">
-          <button
-            className="btn btn-checkout"
-            onClick={() => onCheckout()}
-            disabled={checkoutStatus === 'submitting' || itemCount === 0}
-          >
-            {checkoutStatus === 'submitting' ? 'Checking out...' : 'Checkout'}
-          </button>
+          <CheckoutButton />
         </div>
       </aside>
     </>
