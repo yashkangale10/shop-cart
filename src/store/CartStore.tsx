@@ -5,9 +5,7 @@ type CartSlice = {
   items: CartItem[];
   addItem: (product: Product) => void;
   removeItem: (id: string) => void;
-  checkout: () => Promise<void>;
-  checkoutStatus: 'idle' | 'submitting' | 'error' | 'success';
-  cartError: string | null;
+  clearCart: () => void;
 };
 
 type ProductSlice = {
@@ -24,10 +22,8 @@ type UiSlice = {
 
 type Store = CartSlice & ProductSlice & UiSlice;
 
-const createCartSlice: StateCreator<Store, [], [], CartSlice> = (set, get) => ({
+const createCartSlice: StateCreator<Store, [], [], CartSlice> = (set) => ({
   items: [],
-  checkoutStatus: 'idle',
-  cartError: null,
   addItem: (product) =>
     set((state) => {
       const existing = state.items.find((i) => i.id === product.id);
@@ -37,41 +33,11 @@ const createCartSlice: StateCreator<Store, [], [], CartSlice> = (set, get) => ({
           )
         : [...state.items, { ...product, quantity: 1 }];
 
-      return {
-        items,
-        checkoutStatus: 'idle',
-        cartError: null,
-      };
+      return { items };
     }),
   removeItem: (id) =>
     set((state) => ({ items: state.items.filter((i) => i.id !== id) })),
-  checkout: async () => {
-    const items = get().items;
-    if (items.length === 0) return;
-
-    set({ checkoutStatus: 'submitting', cartError: null });
-    try {
-      const total = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
-      const res = await fetch('/api/orders', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          items,
-          total,
-          outcome: 'success',
-        }),
-      });
-      if (!res.ok) {
-        throw new Error(`Checkout failed with status: ${res.status}`);
-      }
-      set({ items: [], checkoutStatus: 'success' });
-    } catch (err) {
-      set({
-        checkoutStatus: 'error',
-        cartError: err instanceof Error ? err.message : 'Checkout failed',
-      });
-    }
-  },
+  clearCart: () => set({ items: [] }),
 });
 
 const createProductSlice: StateCreator<Store, [], [], ProductSlice> = (set) => ({

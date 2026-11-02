@@ -1,14 +1,25 @@
-import { useCartStore } from "../store/CartStore";
-import { useShallow } from "zustand/shallow";
+import { useCartStore } from '../store/CartStore';
+import { CheckoutActorContext } from '../machines/CheckoutActorContext';
 
+/**
+ * Subscribes granularly to the checkout machine's items context slice.
+ * The removeItem action is dispatched to Zustand; CartSynchronizer will
+ * propagate the change back to the machine via SYNC_CART.
+ */
 export default function CartItemsList() {
+  const items = CheckoutActorContext.useSelector(
+    (state) => state.context.items,
+  );
+  const removeItem = useCartStore((state) => state.removeItem);
 
-  const { items, removeItem } = useCartStore(useShallow(state => ({ items: state.items, removeItem: state.removeItem })))
   if (items.length === 0) {
     return <p className="cart-empty">Your cart is empty.</p>;
   }
 
-  const total = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  const total = items.reduce(
+    (sum, item) => sum + item.price * item.quantity,
+    0,
+  );
 
   return (
     <div className="cart-items-list">
@@ -37,4 +48,3 @@ export default function CartItemsList() {
     </div>
   );
 }
-

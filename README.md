@@ -1,26 +1,121 @@
-# ShopCart — Deliverable 2
+# ShopCart — Enterprise Checkout Workflow (Deliverable 4)
 
-ShopCart is a shopping cart web application built with React, TypeScript, and Vite. This project implements Deliverable 2, migrating state management from React Context to [Zustand](https://github.com/pmndrs/zustand) using a modular, sliced-store architecture, atomic and shallow-equality selectors (`useShallow`), and asynchronous side-effect handlers.
+ShopCart is a modern shopping cart web application built with **React 19**, **TypeScript**, **Zustand 5**, and **XState v5**.
+
+Deliverable 4 models checkout as a coordinated, multi-step workflow spanning separate, non-parent-child branches of the application. It decouples the core checkout workflow into an **XState finite state machine**, integrates a sibling **PaymentPanel**, deconstructs **CartDrawer** into granular leaf subscribers, and coordinates state between Zustand and XState using **headless bridge components**.
 
 ---
 
-## Features
+## Architecture & Component Hierarchy
 
-- **Product Catalog (`ProductSlice`)**:
-  - Fetches product inventory asynchronously via a simulated REST API (`/api/products`).
-  - Granular request lifecycle management (`idle`, `fetching`, `error`, `success`).
-- **Cart State Management (`CartSlice`)**:
-  - Add items to the cart (`addItem`: increments item quantity if existing, appends new item with `quantity: 1` if not, and resets checkout status).
-  - Remove entire line items from the cart (`removeItem`).
-  - Derived calculations for line item subtotals, cart total, and total item count badge without state duplication.
-  - **Asynchronous Checkout (`checkout`)**: Validates cart contents and submits order details to `/api/orders` with explicit `submitting`, `success`, and `error` status reporting.
-- **UI State Management (`UiSlice`)**:
-  - Controls slide-over cart drawer visibility (`cartOpen`, `toggleCartDrawer`).
-- **Optimized Rendering & Selectors**:
-  - Action-only components (e.g. `ProductCard`) subscribe strictly to action creators, avoiding re-renders when cart or product state mutates.
-  - Multi-property consumers (e.g. `CartDrawer`, `CartItemsList`, `Toolbar`, `App`) employ `useShallow` to ensure stable references and eliminate redundant re-render cycles.
-- **Slide-Over Drawer**: Responsive sliding cart drawer with backdrop, empty cart placeholder, live status updates, and interactive checkout button.
-- **Mock REST API**: Powered by `json-server` with a simulated delay to emulate real-world latency.
+```text
+App
+├── CheckoutActorContext.Provider (shared XState actor)
+│   ├── CartSynchronizer          (headless store-to-machine sync)
+│   ├── OrderCompletionBridge     (headless machine-to-store clear)
+│   ├── Header
+│   │   └── Toolbar
+│   │       └── CartBadge
+│   ├── Catalog
+│   │   └── ProductCard
+│   ├── CartDrawer
+│   │   ├── CartItemsList         (subscribes to machine context.items)
+│   │   ├── CartErrorBanner       [NEW] (subscribes to machine context.error)
+│   │   └── CheckoutButton        [NEW] (subscribes to machine transition capabilities)
+│   └── PaymentPanel              [NEW] (sibling panel sharing the checkout actor)
+```
+
+---
+
+## State Machine Architecture (`checkoutMachine`)
+
+The checkout process is modeled as an XState v5 state machine with explicit qualitative states, guards, and promise actor invocations:
+
+```mermaid
+stateDiagram-v2
+  [*] --> reviewing
+
+  reviewing --> submitting : SUBMIT [cartNotEmpty]
+  reviewing --> reviewing : SYNC_CART
+
+  submitting --> success : onDone (payment succeeded)
+  submitting --> reviewing : onError (retains error message)
+  submitting --> reviewing : CANCEL (aborts HTTP request via AbortSignal)
+  submitting --> submitting : SYNC_CART
+
+  success --> reviewing : RESET (after 3s acknowledgment delay)
+```
+
+### Key Machine Features
+
+1. **Qualitative States**:
+   - `reviewing`: Cart items are being reviewed. Accepts `SYNC_CART` and `SUBMIT`.
+   - `submitting`: Payment submission in flight via invoked promise actor `processPayment`.
+   - `success`: Terminal order completion state.
+
+2. **Enforced Guards**:
+   - `cartNotEmpty`: Evaluates `context.items.length > 0`. Prevents submission if the cart is empty.
+
+3. **Declarative UI Querying (`can`)**:
+   - `CheckoutButton` and `PaymentPanel` query `state.can({ type: 'SUBMIT' })` to toggle disabled states. This eliminates hardcoded business validation in JSX.
+
+4. **Promise Actor with Native `AbortSignal`**:
+   - `processPayment` executes an asynchronous `POST /api/orders` request with the items and total.
+   - Accepts the runtime `signal: AbortSignal`.
+   - Exiting `submitting` via `CANCEL` terminates the actor, immediately triggering signal abortion. The request displays as `(canceled)` in DevTools Network tab.
+
+5. **Error Resilience**:
+   - Server or network errors transition the machine back to `reviewing` while retaining the error in `context.error` for display.
+
+---
+
+## Bidirectional Zustand ↔ Machine Synchronization
+
+State responsibilities are cleanly decoupled: Zustand owns global catalog and cart inventory collections, while XState owns the checkout process lifecycle.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant Zustand as Zustand (CartStore)
+    participant SyncBridge as CartSynchronizer (Headless)
+    participant Machine as XState (CheckoutActor)
+    participant API as json-server (/api/orders)
+    participant OrderBridge as OrderCompletionBridge (Headless)
+
+    User->>Zustand: addItem() / removeItem()
+    Zustand-->>SyncBridge: items updated
+    SyncBridge->>Machine: send({ type: 'SYNC_CART', items })
+
+    User->>Machine: send({ type: 'SUBMIT' })
+    Machine->>API: POST /api/orders (with AbortSignal)
+    API-->>Machine: 201 Created (Success)
+    Machine->>Machine: Transition to 'success'
+
+    Machine-->>OrderBridge: state.matches('success')
+    OrderBridge->>Zustand: clearCart()
+    OrderBridge->>Machine: send({ type: 'RESET' }) after 3s delay
+```
+
+- **Store → Machine (`CartSynchronizer`)**:
+  - Headless bridge listening to Zustand cart item changes.
+  - Automatically dispatches `SYNC_CART` into the running actor so the machine always processes the latest items.
+- **Machine → Store (`OrderCompletionBridge`)**:
+  - Headless bridge listening to the machine entering the `success` state.
+  - Automatically invokes `clearCart()` in Zustand without embedding store mutations inside machine definitions.
+  - Resets the machine back to `reviewing` after a 3-second display window.
+
+---
+
+## Granular Component Subscriptions
+
+To optimize rendering and avoid container re-renders during state transitions:
+
+- **`CartDrawer`**: Pure layout shell with no direct subscriptions to checkout status or errors.
+- **`CartItemsList`**: Subscribes specifically to `state.context.items` via `CheckoutActorContext.useSelector`.
+- **`CartErrorBanner`**: Subscribes exclusively to `state.context.error`. Renders alert messages only when an error occurs.
+- **`CheckoutButton`**: Subscribes to `state.can({ type: 'SUBMIT' })` and `state.matches('submitting')`.
+- **`PaymentPanel`**: Rendered as a direct sibling to `CartDrawer` in `App.tsx`, sharing the single actor via `CheckoutActorContext`. Provides payment status indicators, "Submit Payment", and mid-flight "Cancel" controls.
 
 ---
 
@@ -28,26 +123,11 @@ ShopCart is a shopping cart web application built with React, TypeScript, and Vi
 
 - **Framework**: [React 19](https://react.dev/)
 - **Language**: [TypeScript](https://www.typescriptlang.org/)
-- **Build Tool / Dev Server**: [Vite](https://vitejs.dev/)
-- **State Management**: [Zustand 5](https://github.com/pmndrs/zustand) (Sliced Store Pattern)
-- **Mock API**: `json-server@0.17.4`
-- **Styling**: Pure semantic CSS (no third-party UI libraries)
-
----
-
-## Component Hierarchy
-
-```text
-App
-├── Header
-│   └── Toolbar
-│       └── CartBadge
-├── Catalog
-│   └── ProductCard
-└── CartDrawer
-    ├── CartItemsList
-    └── (Checkout Status Feedback)
-```
+- **Build Tool / Dev Server**: [Vite 8](https://vitejs.dev/)
+- **State Machine**: [XState v5](https://stately.ai/docs/xstate) (`xstate` & `@xstate/react`)
+- **State Management**: [Zustand 5](https://github.com/pmndrs/zustand)
+- **Mock REST API**: `json-server@0.17.4`
+- **Styling**: Semantic CSS
 
 ---
 
@@ -55,102 +135,34 @@ App
 
 ```text
 shop-cart/
-├── db.json                       # Mock API database (products & orders)
-├── vite.config.ts                # Vite config with API proxy setup
-├── package.json                  # Scripts & dependencies
+├── db.json                               # Mock database (products & persisted orders)
+├── vite.config.ts                        # Vite config with API proxy
+├── package.json                          # Dependencies & run scripts
 ├── src/
 │   ├── types/
-│   │   └── index.ts              # Shared TypeScript definitions (Product, CartItem, CheckoutResult)
+│   │   └── index.ts                      # Shared types (Product, CartItem, CheckoutResult)
+│   ├── machines/
+│   │   ├── checkoutMachine.ts            # XState v5 checkout finite state machine
+│   │   └── CheckoutActorContext.tsx      # Shared actor context (createActorContext)
 │   ├── store/
-│   │   └── CartStore.tsx         # Combined Zustand store with modular slices (Cart, Product, UI)
+│   │   └── CartStore.tsx                 # Modular Zustand store (Cart, Product, UI slices)
 │   ├── components/
-│   │   ├── Header.tsx            # Navigation container
-│   │   ├── Toolbar.tsx           # Store branding and cart trigger
-│   │   ├── CartBadge.tsx         # Total item count badge
-│   │   ├── Catalog.tsx           # Product catalog grid and data fetcher
-│   │   ├── ProductCard.tsx       # Individual product card (action subscriber)
-│   │   ├── CartDrawer.tsx        # Slide-over sidebar drawer with checkout & live status
-│   │   └── CartItemsList.tsx     # Cart contents, subtotals, and remove actions
-│   ├── App.tsx                   # Root component
-│   ├── App.css                   # Global styling and component layout
-│   └── main.tsx                  # Application entry point
+│   │   ├── CartSynchronizer.tsx          # [NEW] Headless store-to-machine synchronizer
+│   │   ├── OrderCompletionBridge.tsx     # [NEW] Headless machine-to-store completion handler
+│   │   ├── PaymentPanel.tsx              # [NEW] Sibling payment panel with cancel trigger
+│   │   ├── CartErrorBanner.tsx           # [NEW] Leaf error display component
+│   │   ├── CheckoutButton.tsx            # [NEW] Leaf declarative checkout trigger
+│   │   ├── CartDrawer.tsx                # Slide-over cart drawer container
+│   │   ├── CartItemsList.tsx             # Line items subscriber
+│   │   ├── CartBadge.tsx                 # Header cart badge counter
+│   │   ├── Catalog.tsx                   # Product catalog grid
+│   │   ├── ProductCard.tsx               # Product card
+│   │   ├── Header.tsx                    # Site header wrapper
+│   │   └── Toolbar.tsx                   # Top navigation toolbar
+│   ├── App.tsx                           # Root app with actor provider & sibling panels
+│   ├── App.css                           # Application styling
+│   └── main.tsx                          # Application entry point
 ```
-
----
-
-## State Management Architecture (Zustand)
-
-The store is organized using Zustand's **Slice Pattern** (`StateCreator`), allowing logical domain separation into modular slices while exposing a single unified hook (`useCartStore`):
-
-### 1. `ProductSlice`
-Manages product catalog data and retrieval lifecycle:
-- `products: Product[]`: Cached inventory items.
-- `fetchStatus: 'idle' | 'fetching' | 'error' | 'success'`: Request status.
-- `productError: string | null`: Error message on failure.
-- `fetchProducts: () => Promise<void>`: Asynchronously loads `/api/products`.
-
-### 2. `CartSlice`
-Manages shopping cart operations and order processing:
-- `items: CartItem[]`: Items currently in the cart with their respective quantities.
-- `checkoutStatus: 'idle' | 'submitting' | 'error' | 'success'`: Order placement status.
-- `cartError: string | null`: Error description if checkout fails.
-- `addItem: (product: Product) => void`: Immutably adds or increments an item; resets previous checkout status.
-- `removeItem: (id: string) => void`: Filters out an item by ID.
-- `checkout: () => Promise<void>`: Submits an order object (`{ items, total, outcome }`) to `/api/orders` and clears the cart on success.
-
-### 3. `UiSlice`
-Manages local UI controls shared across decoupled components:
-- `cartOpen: boolean`: Toggle state for the cart drawer.
-- `toggleCartDrawer: () => void`: Inverts drawer visibility.
-
-### 4. Fine-Grained Subscriptions & `useShallow`
-To avoid unnecessary re-renders:
-- Components subscribe to atomic primitives where possible:
-  ```tsx
-  const addToCart = useCartStore((s) => s.addItem);
-  ```
-- When extracting composite objects, `useShallow` from `zustand/shallow` ensures shallow reference comparison:
-  ```tsx
-  const { onCheckout, checkoutStatus, cartError, itemCount } = useCartStore(
-    useShallow((state) => ({
-      onCheckout: state.checkout,
-      checkoutStatus: state.checkoutStatus,
-      cartError: state.cartError,
-      itemCount: state.items.length,
-    }))
-  );
-  ```
-
-### 5. Derived Values
-Computed on-the-fly inside consumer components to avoid stale or duplicated state:
-- **Total item quantity**: `items.reduce((sum, item) => sum + (item.quantity || 0), 0)`
-- **Line item subtotal**: `item.price * item.quantity`
-- **Cart total**: `items.reduce((sum, item) => sum + item.price * item.quantity, 0)`
-
----
-
-## API Configuration & Proxy
-
-- **Mock API**: `json-server` runs on port `3001` with a simulated delay of 1500ms:
-  ```json
-  "server": "json-server --watch db.json --port 3001 --delay 1500"
-  ```
-- **Endpoints**:
-  - `GET /api/products`: Returns the catalog of products.
-  - `POST /api/orders`: Records checkout orders.
-- **Vite Proxy**: Configured in `vite.config.ts` to forward frontend `/api/*` calls to `http://localhost:3001/*`:
-  ```ts
-  server: {
-    port: 5173,
-    proxy: {
-      '/api': {
-        target: 'http://localhost:3001',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api/, ''),
-      },
-    },
-  }
-  ```
 
 ---
 
@@ -162,28 +174,45 @@ Computed on-the-fly inside consumer components to avoid stale or duplicated stat
 npm install
 ```
 
-### 2. Start the Development Servers
+### 2. Run the Application
 
-Run the mock server and the Vite development server in two separate terminals:
+Run the mock API server and the Vite dev server in separate terminal windows:
 
 **Terminal 1 — Mock API Server:**
 ```bash
 npm run server
 ```
-*Starts mock API on [http://localhost:3001](http://localhost:3001).*
+*Runs on `http://localhost:3001` with a 1500ms simulated latency.*
 
-**Terminal 2 — Frontend Application:**
+**Terminal 2 — Vite Dev Server:**
 ```bash
 npm run dev
 ```
-*Starts frontend on [http://localhost:5173](http://localhost:5173).*
+*Runs frontend on `http://localhost:5173`.*
 
 ---
 
-## Build & Verification
+## Verification & Manual Testing
 
-To verify TypeScript types and build the production bundle:
-
-```bash
-npm run build
-```
+1. **Declarative Empty Cart Guard**:
+   - Ensure the cart is empty.
+   - Verify both the "Checkout" button in `CartDrawer` and "Submit Payment" in `PaymentPanel` are disabled via `state.can({ type: 'SUBMIT' })`.
+2. **Mid-Flight Cancellation (`AbortSignal`)**:
+   - Add items to the cart.
+   - Click "Submit Payment" or "Checkout".
+   - Immediately click "Cancel" in `PaymentPanel` while the request is in flight.
+   - Inspect the **Network** tab in DevTools: verify `POST /api/orders` displays status `(canceled)`.
+   - Verify the UI returns to the `reviewing` state with cart items intact.
+3. **Successful Order Flow**:
+   - Add items to the cart and click "Submit Payment".
+   - Allow the 1500ms request to complete.
+   - Observe the success confirmation in `PaymentPanel`.
+   - Verify `OrderCompletionBridge` clears the active Zustand cart and resets the machine back to `reviewing` after 3 seconds.
+4. **Error Handling**:
+   - Stop the `json-server` process (or simulate a network failure).
+   - Attempt checkout.
+   - Verify the machine transitions back to `reviewing` while retaining the error message, displayed cleanly in `CartErrorBanner` and `PaymentPanel`.
+5. **Type Check & Production Build**:
+   ```bash
+   npm run build
+   ```
